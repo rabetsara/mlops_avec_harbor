@@ -2,9 +2,14 @@ pipeline {
     agent any
 
     environment {
-        TRIVY_CACHE = "/tmp/trivy-cache"
-        REPORT_DIR  = "${WORKSPACE}/trivy-reports"
-        API_PORT    = "8081"
+        TRIVY_CACHE    = "/tmp/trivy-cache"
+        REPORT_DIR     = "${WORKSPACE}/trivy-reports"
+        API_PORT       = "8081"
+        HARBOR_URL     = "http://10.32.232.154:9090/"
+        HARBOR_PROJECT = "mlops"
+        IMAGE_NAME     = "smartphones-ml-app"
+        IMAGE_TAG      = "build-${BUILD_NUMBER}"
+        FULL_IMAGE     = "http://10.32.232.154:9090//mlops/smartphones-ml-app:build-${BUILD_NUMBER}"
     }
 
     stages {
@@ -13,7 +18,8 @@ pipeline {
             steps {
                 echo "Nettoyage..."
                 sh 'docker-compose down --remove-orphans || true'
-                sh 'docker rmi smartphones-ml-app || true'
+                sh "docker rmi ${FULL_IMAGE} || true"
+                sh "docker rmi ${HARBOR_URL}/${HARBOR_PROJECT}/${IMAGE_NAME}:latest || true"
                 sh 'docker stop smartphones-api || true'
                 sh 'docker rm   smartphones-api || true'
                 sh '''
@@ -30,7 +36,11 @@ pipeline {
         stage('Build Image') {
             steps {
                 echo "Build Docker..."
-                sh 'docker-compose build app'
+                sh "docker-compose build app"
+                // Tagger l'image avec Harbor
+                sh "docker tag smartphones-ml-app ${FULL_IMAGE}"
+                sh "docker tag smartphones-ml-app ${HARBOR_URL}/${HARBOR_PROJECT}/${IMAGE_NAME}:latest"
+                echo "Image taguee : ${FULL_IMAGE}"
             }
         }
 
@@ -98,6 +108,28 @@ pipeline {
             }
         }
 
+        stage('Push to Harbor') {
+            steps {
+                echo "Push de l image vers Harbor..."
+                withCredentials([usernamePassword(
+                    credentialsId: 'harbor-credentials',
+                    usernameVariable: 'HARBOR_USER',
+                    passwordVariable: 'HARBOR_PASS'
+                )]) {
+                    sh """
+                        echo \$HARBOR_PASS | docker login ${HARBOR_URL} \
+                            -u \$HARBOR_USER --password-stdin
+
+                        docker push ${FULL_IMAGE}
+                        docker push ${HARBOR_URL}/${HARBOR_PROJECT}/${IMAGE_NAME}:latest
+
+                        echo "Image disponible dans Harbor :"
+                        echo "  ${FULL_IMAGE}"
+                    """
+                }
+            }
+        }
+
         stage('Start MLflow') {
             steps {
                 echo "Demarrage MLflow..."
@@ -150,20 +182,29 @@ pipeline {
 
         stage('Deploy API') {
             steps {
-                echo "Deploiement de l API sur le port 8081..."
+                echo "Deploiement de l API depuis Harbor sur le port 8081..."
                 sh '''
                     docker stop smartphones-api || true
                     docker rm   smartphones-api || true
 
-                    # Recuperer le reseau via docker network ls filtre sur le projet
-                    NETWORK=$(docker inspect mlflow_server --format="{{json .NetworkSettings.Networks}}" | tr ',' '\n' | grep -o '"[^"]*_default"' | head -1 | tr -d '"')
+                    NETWORK=$(docker inspect mlflow_server \
+                        --format="{{json .NetworkSettings.Networks}}" \
+                        | tr "," "\n" \
+                        | grep -o '"[^"]*_default"' \
+                        | head -1 \
+                        | tr -d '"')
 
-                    # Fallback si le reseau n est pas detecte
                     if [ -z "$NETWORK" ]; then
-                        NETWORK=$(docker network ls --filter "name=default" --format "{{.Name}}" | grep -v bridge | head -1)
+                        NETWORK=$(docker network ls \
+                            --filter "name=default" \
+                            --format "{{.Name}}" \
+                            | grep -v bridge | head -1)
                     fi
 
                     echo "Reseau detecte : ${NETWORK}"
+
+                    # Pull depuis Harbor pour garantir la bonne version
+                    docker pull ${FULL_IMAGE}
 
                     docker run -d \
                         --name smartphones-api \
@@ -173,7 +214,7 @@ pipeline {
                         -e MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=true \
                         -v $(pwd)/mlruns:/mlflow/mlruns \
                         -v $(pwd)/workspace:/app/workspace \
-                        smartphones-ml-app \
+                        ${FULL_IMAGE} \
                         mlflow models serve \
                             -m "models:/smartphones_price_model@Production" \
                             --host 0.0.0.0 \
@@ -203,6 +244,7 @@ pipeline {
         }
         success {
             echo "Pipeline OK - API disponible sur http://localhost:8081/invocations"
+            echo "Image stockee dans Harbor : ${FULL_IMAGE}"
         }
         failure {
             echo "Pipeline FAILED"
